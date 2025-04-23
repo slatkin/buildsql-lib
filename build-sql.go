@@ -43,13 +43,10 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 		errorFlag           = false
 		successCount        = 0
 		spFileLine          = 0
-		errorChan           = make(chan FileError, 1000)
-		resultChan          = make(chan bool, 1000)
 		allFiles            = make(map[string]bool)
 		wg                  sync.WaitGroup
-		mu                  sync.Mutex      // For synchronized writes to output buffer
-		sqlOutputBuffer     strings.Builder // Buffer to store SQL content instead of file
-		errorMessages       []string        // To collect error messages
+		mu                  sync.Mutex
+		sqlOutputBuffer     strings.Builder
 	)
 
 	// Create log file
@@ -85,32 +82,24 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 				// Check if file exists
 				_, statErr := os.Stat(fileName)
 				if statErr != nil {
-					errorChan <- FileError{
-						FileName:    fileName,
-						Description: fmt.Sprintf("File not found: %v", statErr),
-						LineNumber:  line,
-						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
-					}
-					resultChan <- false
+					fmt.Printf("Error: File not found: %s (line %d): %v\n",
+						fileName, line, statErr)
+					errorFlag = true
 					return
 				}
 
 				// Try to open the file
 				fileContent, err := os.ReadFile(fileName)
 				if err != nil {
-					errorChan <- FileError{
-						FileName:    fileName,
-						Description: err.Error(),
-						LineNumber:  line,
-						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
-					}
-					resultChan <- false
+					fmt.Printf("Error reading file: %s (line %d): %v\n",
+						fileName, line, err)
+					errorFlag = true
 					return
 				}
 
 				// Create SQL content with header and print statement
 				header := createHeader(fileName)
-				printStatement := createPrintStatement(fileName) // Note: Using createPrintStatement for updates
+				printStatement := createPrintStatement(fileName)
 
 				// Lock for synchronized writing to output buffer
 				mu.Lock()
@@ -126,71 +115,30 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 				// Write the file content
 				_, writeErr := sqlOutputBuffer.WriteString(string(fileContent))
 				if writeErr != nil {
-					errorChan <- FileError{
-						FileName:    fileName,
-						Description: writeErr.Error(),
-						LineNumber:  line,
-						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
-						Content:     string(fileContent),
-					}
-					resultChan <- false
+					fmt.Printf("Error writing content to buffer: %s (line %d): %v\n",
+						fileName, line, writeErr)
+					errorFlag = true
 					return
 				}
 
 				// Mark file as processed
 				delete(allFiles, fileName)
-				resultChan <- true
+				successCount++
 			}(spFile, spFileLine)
 		}
 	}
 
-	// Wait for all goroutines to complete and close channels
-	go func() {
-		wg.Wait()
-		close(errorChan)
-		close(resultChan)
-	}()
-
-	// Count successful operations
-	for result := range resultChan {
-		if result {
-			successCount++
-		} else {
-			errorFlag = true
-		}
-	}
+	// Wait for all goroutines to complete
+	wg.Wait()
 
 	// Write final message to output buffer
 	sqlOutputBuffer.WriteString("\n")
 	sqlOutputBuffer.WriteString("print 'Schema Updates Completed...'\n")
 
-	// Write errors to log file and collect error messages
+	// Write to log file
 	logWriter := bufio.NewWriter(logFile)
-	errorCount := 0
-	for err := range errorChan {
-		// Write to log file
-		logWriter.WriteString(fmt.Sprintf("File Name: %s\n", err.FileName))
-		logWriter.WriteString(fmt.Sprintf("Err Message: %s\n", err.Description))
-		if err.LineNumber > 0 {
-			logWriter.WriteString(fmt.Sprintf("Build File Line: %d\n", err.LineNumber))
-		}
-		logWriter.WriteString(fmt.Sprintf("Time Stamp: %s\n", err.TimeStamp))
-		if err.Content != "" {
-			logWriter.WriteString(fmt.Sprintf("Attempted to write: %s\n", err.Content))
-		}
-		logWriter.WriteString("\n")
-
-		// Collect error messages for return
-		errorCount++
-		if errorCount <= 10 { // Limit number of errors included in the return
-			errorMessages = append(errorMessages, fmt.Sprintf("Error in file %s: %s", err.FileName, err.Description))
-		}
-	}
-
-	// Write success count
-	var msg string
 	if errorFlag {
-		msg = "Errors occurred, check log file!\n"
+		msg := "Errors occurred, check log file!\n"
 		logWriter.WriteString(msg)
 	}
 	logWriter.WriteString(fmt.Sprintf("Success Count: %d\n", successCount))
@@ -211,15 +159,7 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 
 	if errorFlag {
 		fmt.Println("Errors occurred, check log file!")
-		errorSummary := fmt.Sprintf("%d SQL update errors occurred", errorCount)
-		if len(errorMessages) > 0 {
-			errorSummary += ":\n- " + strings.Join(errorMessages, "\n- ")
-			if errorCount > len(errorMessages) {
-				errorSummary += fmt.Sprintf("\n(and %d more errors, see log file: %s)",
-					errorCount-len(errorMessages), logFilePath)
-			}
-		}
-		return sqlOutputBuffer.String(), fmt.Errorf(errorSummary)
+		return sqlOutputBuffer.String(), fmt.Errorf("SQL update errors occurred, check log file: %s", logFilePath)
 	}
 
 	return sqlOutputBuffer.String(), nil
@@ -239,13 +179,10 @@ func BuildSqlProcs(sourcePath string) string {
 		logFilePath              = filepath.Join(databaseScriptsPath, SP_LOG_FILE)
 		errorFlag                = false
 		successCount             = 0
-		errorChan                = make(chan FileError, 1000)
-		resultChan               = make(chan bool, 1000)
 		allFiles                 = make(map[string]bool)
 		wg                       sync.WaitGroup
 		mu                       sync.Mutex
-		sqlOutputBuffer          strings.Builder // Buffer to store SQL content instead of file
-		fileErrors               []FileError     // Collect errors for later processing
+		sqlOutputBuffer          strings.Builder
 	)
 
 	// Create log file
@@ -262,105 +199,48 @@ func BuildSqlProcs(sourcePath string) string {
 	// Process both build order files
 	processBuildOrderFile(
 		spBuildOrderFilePath,
-		&sqlOutputBuffer, // Use string builder instead of file
+		&sqlOutputBuffer,
+		logFile,
 		allFiles,
 		&wg,
 		&mu,
-		errorChan,
-		resultChan,
 		databaseScriptsPath,
 		true, // Include server settings for SPs
 	)
 
 	processBuildOrderFile(
 		buildUpdateOrderFilePath,
-		&sqlOutputBuffer, // Use string builder instead of file
+		&sqlOutputBuffer,
+		logFile,
 		allFiles,
 		&wg,
 		&mu,
-		errorChan,
-		resultChan,
 		databaseScriptsPath,
 		false, // Don't include server settings for updates
 	)
 
-	// Create a channel to signal when all goroutines are done
-	done := make(chan struct{})
-
-	// Start a collector goroutine to gather results and errors
-	go func() {
-		// First wait for all worker goroutines to finish
-		wg.Wait()
-
-		// Now collect results until channels are empty
-		remaining := 0
-		for {
-			select {
-			case result, ok := <-resultChan:
-				if !ok {
-					// Channel closed
-					break
-				}
-				if result {
-					successCount++
-				} else {
-					errorFlag = true
-				}
-				remaining++
-			case fileErr, ok := <-errorChan:
-				if !ok {
-					// Channel closed
-					break
-				}
-				fileErrors = append(fileErrors, fileErr)
-			default:
-				// No more items in channels
-				close(resultChan)
-				close(errorChan)
-				done <- struct{}{}
-				return
-			}
-		}
-	}()
-
-	// Wait for collector to finish
-	<-done
+	// Wait for all goroutines to complete
+	wg.Wait()
 
 	// Write final message to output buffer
 	sqlOutputBuffer.WriteString("\n")
 	sqlOutputBuffer.WriteString("print 'Stored Procedures Created Successfully...'\n")
 
-	// Write errors to log file
-	logWriter := bufio.NewWriter(logFile)
-	for _, err := range fileErrors {
-		logWriter.WriteString(fmt.Sprintf("File Name: %s\n", err.FileName))
-		logWriter.WriteString(fmt.Sprintf("Err Message: %s\n", err.Description))
-		if err.LineNumber > 0 {
-			logWriter.WriteString(fmt.Sprintf("Build File Line: %d\n", err.LineNumber))
-		}
-		logWriter.WriteString(fmt.Sprintf("Time Stamp: %s\n", err.TimeStamp))
-		if err.Content != "" {
-			logWriter.WriteString(fmt.Sprintf("Attempted to write: %s\n", err.Content))
-		}
-		logWriter.WriteString("\n")
-	}
-
 	// Write success count
 	if errorFlag {
 		msg := "Errors occurred, check log file!\n"
-		logWriter.WriteString(msg)
+		logFile.WriteString(msg)
 	}
-	logWriter.WriteString(fmt.Sprintf("Success Count: %d\n", successCount))
+	logFile.WriteString(fmt.Sprintf("Success Count: %d\n", successCount))
 
 	// Report extra files that weren't in the build list
-	logWriter.WriteString("\nExtra File Report:\n")
+	logFile.WriteString("\nExtra File Report:\n")
 	extraCount := 0
 	for file := range allFiles {
-		logWriter.WriteString(fmt.Sprintf("%s\n", file))
+		logFile.WriteString(fmt.Sprintf("%s\n", file))
 		extraCount++
 	}
-	logWriter.WriteString(fmt.Sprintf("Extra File Count: %d\n", extraCount))
-	logWriter.Flush()
+	logFile.WriteString(fmt.Sprintf("Extra File Count: %d\n", extraCount))
 
 	elapsedTime := time.Since(startTime)
 	fmt.Printf("BuildSqlProcs completed in %v\n", elapsedTime)
@@ -377,11 +257,10 @@ func BuildSqlProcs(sourcePath string) string {
 func processBuildOrderFile(
 	buildOrderFilePath string,
 	sqlOutputBuffer *strings.Builder,
+	logFile *os.File,
 	allFiles map[string]bool,
 	wg *sync.WaitGroup,
 	mu *sync.Mutex,
-	errorChan chan FileError,
-	resultChan chan bool,
 	databaseScriptsPath string,
 	includeServerSettings bool,
 ) {
@@ -428,24 +307,17 @@ func processBuildOrderFile(
 				// Check if file exists
 				_, statErr := os.Stat(currentFile)
 				if statErr != nil {
-					errorChan <- FileError{
-						FileName:    currentFile,
-						Description: fmt.Sprintf("File not found: %v", statErr),
-						LineNumber:  currentLine,
-						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
-					}
+					// Just log the error to console
+					fmt.Printf("Error: File not found: %s (line %d): %v\n",
+						currentFile, currentLine, statErr)
 					return
 				}
 
 				// Read the file content
 				fileContent, err := os.ReadFile(currentFile)
 				if err != nil {
-					errorChan <- FileError{
-						FileName:    currentFile,
-						Description: err.Error(),
-						LineNumber:  currentLine,
-						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
-					}
+					fmt.Printf("Error reading file: %s (line %d): %v\n",
+						currentFile, currentLine, err)
 					return
 				}
 
@@ -473,21 +345,13 @@ func processBuildOrderFile(
 
 				// Write content
 				if _, err := sqlOutputBuffer.WriteString(string(fileContent)); err != nil {
-					errorChan <- FileError{
-						FileName:    currentFile,
-						Description: err.Error(),
-						LineNumber:  currentLine,
-						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
-						Content:     string(fileContent),
-					}
+					fmt.Printf("Error writing content to buffer: %s (line %d): %v\n",
+						currentFile, currentLine, err)
 					return
 				}
 
 				// Mark file as processed
 				delete(allFiles, currentFile)
-
-				// Signal success
-				resultChan <- true
 			}()
 		}
 	}
