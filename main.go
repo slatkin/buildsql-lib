@@ -59,19 +59,28 @@ func BuildSQL(sqlPath string) error {
 	os.Remove(crdbFilePath)
 	os.Remove(updateTablesFilePath)
 
+	// Use error channels for each goroutine
+	spErrCh := make(chan error, 1)
+	updateErrCh := make(chan error, 1)
+	dataErrCh := make(chan error, 1)
+
+	// Results channels
+	spContentCh := make(chan string, 1)
+	updateContentCh := make(chan string, 1)
+	dataContentCh := make(chan string, 1)
+
 	// Use WaitGroup to synchronize goroutines
 	var wg sync.WaitGroup
-	var spContent, updateContent string
-	var dataContent string
-	var spErr, updateErr, dataErr error
 
 	// Run BuildSqlProcs concurrently
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		spContent = BuildSqlProcs(sqlPath)
-		if spContent == "" {
-			spErr = fmt.Errorf("failed to generate stored procedures content")
+		content := BuildSqlProcs(sqlPath)
+		if content == "" {
+			spErrCh <- fmt.Errorf("failed to generate stored procedures content")
+		} else {
+			spContentCh <- content
 		}
 	}()
 
@@ -79,10 +88,16 @@ func BuildSQL(sqlPath string) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		updateContent, updateErr = BuildSqlUpdates(sqlPath)
-		if updateContent == "" && updateErr == nil {
-			updateErr = fmt.Errorf("failed to generate updates content")
+		content, err := BuildSqlUpdates(sqlPath)
+		if err != nil {
+			updateErrCh <- err
+			return
 		}
+		if content == "" {
+			updateErrCh <- fmt.Errorf("failed to generate updates content")
+			return
+		}
+		updateContentCh <- content
 	}()
 
 	// Build SQL data content in memory concurrently
@@ -108,7 +123,7 @@ func BuildSQL(sqlPath string) error {
 			fullPath := filepath.Join(sqlPath, file)
 			data, err := os.ReadFile(fullPath)
 			if err != nil {
-				dataErr = fmt.Errorf("failed to read file %s: %w", fullPath, err)
+				dataErrCh <- fmt.Errorf("failed to read file %s: %w", fullPath, err)
 				return
 			}
 
@@ -117,22 +132,33 @@ func BuildSQL(sqlPath string) error {
 			dataBuffer.Write(data)
 		}
 
-		dataContent = dataBuffer.String()
+		dataContentCh <- dataBuffer.String()
 	}()
 
 	// Wait for all goroutines to complete
 	wg.Wait()
+	close(spErrCh)
+	close(updateErrCh)
+	close(dataErrCh)
+	close(spContentCh)
+	close(updateContentCh)
+	close(dataContentCh)
 
 	// Check for errors
-	if spErr != nil {
-		return spErr
+	if err := <-spErrCh; err != nil {
+		return err
 	}
-	if updateErr != nil {
-		return updateErr
+	if err := <-updateErrCh; err != nil {
+		return err
 	}
-	if dataErr != nil {
-		return dataErr
+	if err := <-dataErrCh; err != nil {
+		return err
 	}
+
+	// Retrieve results
+	spContent := <-spContentCh
+	updateContent := <-updateContentCh
+	dataContent := <-dataContentCh
 
 	// Write the generated SQL content to files
 	if err := os.WriteFile(dataFilePath, []byte(dataContent), 0644); err != nil {

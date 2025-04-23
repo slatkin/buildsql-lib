@@ -375,10 +375,10 @@ func BuildSqlProcs(sourcePath string) string {
 	return sqlOutputBuffer.String()
 }
 
-// processBuildOrderFile processes a single build order file
+// processBuildOrderFile processes SQL files according to a build order
 func processBuildOrderFile(
 	buildOrderFilePath string,
-	sqlOutputBuffer io.Writer,
+	sqlOutputBuffer *strings.Builder,
 	logFile *os.File,
 	allFiles map[string]bool,
 	wg *sync.WaitGroup,
@@ -387,36 +387,65 @@ func processBuildOrderFile(
 	resultChan chan bool,
 	databaseScriptsPath string,
 	includeServerSettings bool,
-) (int, bool) {
-	var (
-		successCount = 0
-		errorFlag    = false
-		lineNumber   = 0 // Changed variable name to be clearer
-	)
-
+) {
 	// Open build order file
 	buildOrderFile, err := os.Open(buildOrderFilePath)
 	if err != nil {
 		fmt.Printf("Error opening build order file %s: %v\n", buildOrderFilePath, err)
-		return 0, true
+		return
 	}
 	defer buildOrderFile.Close()
 
+	// Write server settings if required
+	if includeServerSettings {
+		mu.Lock()
+		appendMiscSettings(sqlOutputBuffer, databaseScriptsPath)
+		mu.Unlock()
+	}
+
 	// Process build order file
 	scanner := bufio.NewScanner(buildOrderFile)
+	spFileLine := 0
+
+	// Use a local WaitGroup to ensure all goroutines started from this function complete
+	var localWg sync.WaitGroup
+
 	for scanner.Scan() {
 		spFile := strings.TrimSpace(scanner.Text())
-		lineNumber++ // Increment the line counter for each line processed
+		spFileLine++
 
 		if len(spFile) > 0 && !strings.HasPrefix(spFile, "'") {
+			// Prepare full path for file if not absolute
+			if !filepath.IsAbs(spFile) {
+				spFile = filepath.Join(databaseScriptsPath, spFile)
+			}
+
+			localWg.Add(1)
 			wg.Add(1)
-			go func(fileName string, line int, includeSettings bool) {
+
+			// Create a buffered error channel for this goroutine
+			thisFileError := make(chan error, 1)
+
+			go func(fileName string, line int) {
+				defer localWg.Done()
 				defer wg.Done()
+
+				// Check if file exists
+				_, statErr := os.Stat(fileName)
+				if statErr != nil {
+					errorChan <- FileError{
+						FileName:    fileName,
+						Description: fmt.Sprintf("File not found: %v", statErr),
+						LineNumber:  line,
+						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
+					}
+					resultChan <- false
+					return
+				}
 
 				// Try to open the file
 				fileContent, err := os.ReadFile(fileName)
 				if err != nil {
-					// Handle file not found or other read errors gracefully
 					errorChan <- FileError{
 						FileName:    fileName,
 						Description: err.Error(),
@@ -427,48 +456,77 @@ func processBuildOrderFile(
 					return
 				}
 
-				// Create SQL content with header and print statement
-				header := createHeader(fileName)
-				printStatement := createStoredProcPrint(fileName)
+				// Create header and print statement
+				var header, printStatement string
 
-				// Lock for synchronized writing to output buffer
-				mu.Lock()
-				defer mu.Unlock()
-
-				// Write to output buffer with proper spacing
-				sqlOutputBuffer.Write([]byte("\n"))
-				sqlOutputBuffer.Write([]byte(header))
-				sqlOutputBuffer.Write([]byte("\n\n"))
-				sqlOutputBuffer.Write([]byte(printStatement))
-				sqlOutputBuffer.Write([]byte("\n\n"))
-
-				// Add server settings if needed
-				if includeSettings {
-					appendMiscSettings(sqlOutputBuffer, databaseScriptsPath)
+				if includeServerSettings {
+					header = createHeader(fileName)
+					printStatement = createStoredProcPrint(fileName)
+				} else {
+					header = createHeader(fileName)
+					printStatement = createPrintStatement(fileName)
 				}
 
-				_, writeErr := sqlOutputBuffer.Write(fileContent)
-				if writeErr != nil {
+				// Lock for synchronized writing to buffer
+				mu.Lock()
+				defer func() {
+					mu.Unlock()
+
+					// Use non-blocking send on the result channel to avoid deadlocks
+					select {
+					case resultChan <- true:
+						// Successfully sent
+					default:
+						// Channel is full, try again with a timeout
+						timer := time.NewTimer(100 * time.Millisecond)
+						select {
+						case resultChan <- true:
+							// Sent successfully
+						case <-timer.C:
+							// Timeout, log an error
+							errorChan <- FileError{
+								FileName:    fileName,
+								Description: "Failed to send result - channel timeout",
+								LineNumber:  line,
+								TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
+							}
+						}
+					}
+				}()
+
+				// Write to output buffer with proper spacing
+				sqlOutputBuffer.WriteString("\n")
+				sqlOutputBuffer.WriteString(header)
+				sqlOutputBuffer.WriteString("\n\n")
+				sqlOutputBuffer.WriteString(printStatement)
+				sqlOutputBuffer.WriteString("\n\n")
+
+				// Write content
+				_, err = sqlOutputBuffer.WriteString(string(fileContent))
+				if err != nil {
+					thisFileError <- err
 					errorChan <- FileError{
 						FileName:    fileName,
-						Description: writeErr.Error(),
+						Description: err.Error(),
 						LineNumber:  line,
 						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
 						Content:     string(fileContent),
 					}
-					resultChan <- false
 					return
 				}
 
-				// Mark file as processed
+				// Mark file as processed (it's safe because we're still holding the lock)
 				delete(allFiles, fileName)
-				resultChan <- true
 
-			}(spFile, lineNumber, includeServerSettings)
+			}(spFile, spFileLine)
 		}
 	}
 
-	return successCount, errorFlag
+	// Wait for all goroutines started by this function to complete
+	// This ensures proper synchronization without blocking other functions
+	go func() {
+		localWg.Wait()
+	}()
 }
 
 // createStoredProcPrint creates a print statement for each stored procedure
