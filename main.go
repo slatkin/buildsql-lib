@@ -59,45 +59,25 @@ func BuildSQL(sqlPath string) error {
 	os.Remove(crdbFilePath)
 	os.Remove(updateTablesFilePath)
 
-	// Use error channels for each goroutine
-	spErrCh := make(chan error, 1)
-	updateErrCh := make(chan error, 1)
-	dataErrCh := make(chan error, 1)
-
-	// Results channels
-	spContentCh := make(chan string, 1)
-	updateContentCh := make(chan string, 1)
-	dataContentCh := make(chan string, 1)
-
-	// Use WaitGroup to synchronize goroutines
+	// Use WaitGroup for synchronization
 	var wg sync.WaitGroup
+
+	// Variables to store results
+	var spContent, updateContent, dataContent string
+	var updateErr, dataErr error
 
 	// Run BuildSqlProcs concurrently
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		content := BuildSqlProcs(sqlPath)
-		if content == "" {
-			spErrCh <- fmt.Errorf("failed to generate stored procedures content")
-		} else {
-			spContentCh <- content
-		}
+		spContent = BuildSqlProcs(sqlPath)
 	}()
 
 	// Run BuildSqlUpdates concurrently
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		content, err := BuildSqlUpdates(sqlPath)
-		if err != nil {
-			updateErrCh <- err
-			return
-		}
-		if content == "" {
-			updateErrCh <- fmt.Errorf("failed to generate updates content")
-			return
-		}
-		updateContentCh <- content
+		updateContent, updateErr = BuildSqlUpdates(sqlPath)
 	}()
 
 	// Build SQL data content in memory concurrently
@@ -123,42 +103,26 @@ func BuildSQL(sqlPath string) error {
 			fullPath := filepath.Join(sqlPath, file)
 			data, err := os.ReadFile(fullPath)
 			if err != nil {
-				dataErrCh <- fmt.Errorf("failed to read file %s: %w", fullPath, err)
+				dataErr = fmt.Errorf("failed to read file %s: %w", fullPath, err)
 				return
 			}
-
-			// Add two blank lines before appending content
 			dataBuffer.WriteString("\n\n")
 			dataBuffer.Write(data)
 		}
 
-		dataContentCh <- dataBuffer.String()
+		dataContent = dataBuffer.String()
 	}()
 
 	// Wait for all goroutines to complete
 	wg.Wait()
-	close(spErrCh)
-	close(updateErrCh)
-	close(dataErrCh)
-	close(spContentCh)
-	close(updateContentCh)
-	close(dataContentCh)
 
 	// Check for errors
-	if err := <-spErrCh; err != nil {
-		return err
+	if updateErr != nil {
+		return updateErr
 	}
-	if err := <-updateErrCh; err != nil {
-		return err
+	if dataErr != nil {
+		return dataErr
 	}
-	if err := <-dataErrCh; err != nil {
-		return err
-	}
-
-	// Retrieve results
-	spContent := <-spContentCh
-	updateContent := <-updateContentCh
-	dataContent := <-dataContentCh
 
 	// Write the generated SQL content to files
 	if err := os.WriteFile(dataFilePath, []byte(dataContent), 0644); err != nil {
