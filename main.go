@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -39,16 +40,24 @@ func AppendSQL(writer io.Writer, filePath string) error {
 // BuildSQL is the main function that builds the SQL files
 func BuildSQL(sqlPath string) error {
 	// Create the Build directory if it doesn't exist
-	if err := os.MkdirAll("Build", os.ModePerm); err != nil {
+	buildDir := filepath.Join(sqlPath, "Build")
+	if err := os.MkdirAll(buildDir, os.ModePerm); err != nil {
 		return fmt.Errorf("failed to create Build directory: %w", err)
 	}
 
+	// Get full paths for SQL files
+	dataFilePath := filepath.Join(sqlPath, SQLDataFile)
+	spFilePath := filepath.Join(sqlPath, SQLSPFile)
+	tablesFilePath := filepath.Join(sqlPath, SQLTablesFile)
+	crdbFilePath := filepath.Join(sqlPath, SQLCRDBFile)
+	updateTablesFilePath := filepath.Join(sqlPath, SQLUpdateTablesFile)
+
 	// Delete existing files if they exist (ignore errors)
-	os.Remove(SQLDataFile)
-	os.Remove(SQLSPFile)
-	os.Remove(SQLTablesFile)
-	os.Remove(SQLCRDBFile)
-	os.Remove(SQLUpdateTablesFile)
+	os.Remove(dataFilePath)
+	os.Remove(spFilePath)
+	os.Remove(tablesFilePath)
+	os.Remove(crdbFilePath)
+	os.Remove(updateTablesFilePath)
 
 	// Use WaitGroup to synchronize goroutines
 	var wg sync.WaitGroup
@@ -96,9 +105,10 @@ func BuildSQL(sqlPath string) error {
 		}
 
 		for _, file := range sqlFiles {
-			data, err := os.ReadFile(file)
+			fullPath := filepath.Join(sqlPath, file)
+			data, err := os.ReadFile(fullPath)
 			if err != nil {
-				dataErr = fmt.Errorf("failed to read file %s: %w", file, err)
+				dataErr = fmt.Errorf("failed to read file %s: %w", fullPath, err)
 				return
 			}
 
@@ -125,21 +135,26 @@ func BuildSQL(sqlPath string) error {
 	}
 
 	// Write the generated SQL content to files
-	if err := os.WriteFile(SQLDataFile, []byte(dataContent), 0644); err != nil {
+	if err := os.WriteFile(dataFilePath, []byte(dataContent), 0644); err != nil {
 		return fmt.Errorf("failed to write data content: %w", err)
 	}
 
-	if err := os.WriteFile(SQLSPFile, []byte(spContent), 0644); err != nil {
+	if err := os.WriteFile(spFilePath, []byte(spContent), 0644); err != nil {
 		return fmt.Errorf("failed to write stored procedures content: %w", err)
 	}
 
-	if err := os.WriteFile(SQLUpdateTablesFile, []byte(updateContent), 0644); err != nil {
+	if err := os.WriteFile(updateTablesFilePath, []byte(updateContent), 0644); err != nil {
 		return fmt.Errorf("failed to write updates content: %w", err)
 	}
 
 	// Copy tables.sql as before
-	if err := copyFile("Schema/tables.sql", SQLTablesFile); err != nil {
+	if err := copyFile(filepath.Join(sqlPath, "Schema/tables.sql"), tablesFilePath); err != nil {
 		return fmt.Errorf("failed to copy tables.sql: %w", err)
+	}
+
+	// Create the CRDB file
+	if err := CreateCRDBFile(sqlPath); err != nil {
+		return fmt.Errorf("failed to create CRDB file: %w", err)
 	}
 
 	return nil
@@ -153,4 +168,32 @@ func copyFile(src, dst string) error {
 	}
 
 	return os.WriteFile(dst, sourceFile, 0644)
+}
+
+// CreateCRDBFile creates the CRDB SQL file
+func CreateCRDBFile(sqlPath string) error {
+	// Create the CRDB file path
+	crdbFilePath := filepath.Join(sqlPath, SQLCRDBFile)
+
+	// Create a new file
+	crdbFile, err := os.Create(crdbFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create CRDB file: %w", err)
+	}
+	defer crdbFile.Close()
+
+	// Append the required SQL files in order
+	if err := AppendSQL(crdbFile, filepath.Join(sqlPath, "Schema/Tables.sql")); err != nil {
+		return fmt.Errorf("failed to append Tables.sql: %w", err)
+	}
+
+	if err := AppendSQL(crdbFile, filepath.Join(sqlPath, SQLDataFile)); err != nil {
+		return fmt.Errorf("failed to append Data file: %w", err)
+	}
+
+	if err := AppendSQL(crdbFile, filepath.Join(sqlPath, SQLSPFile)); err != nil {
+		return fmt.Errorf("failed to append SP file: %w", err)
+	}
+
+	return nil
 }
