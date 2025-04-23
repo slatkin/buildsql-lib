@@ -16,7 +16,6 @@ const (
 	BUILD_UPDATE_ORDER_FILE = "BuildUpdateOrder.txt"
 	SP_LOG_FILE             = "SpBuildLog.txt"
 	DATABASE_SCRIPTS_PATH   = ""
-	SQL_OUTPUT_FILE         = "SqlUpdatesOutput.sql" // Keeping reference but not using it
 	BUILD_ORDER_FILE        = "BuildUpdateOrder.txt"
 	LOG_FILE                = "BuildUpdateLog.txt"
 )
@@ -83,6 +82,19 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 			go func(fileName string, line int) {
 				defer wg.Done()
 
+				// Check if file exists
+				_, statErr := os.Stat(fileName)
+				if statErr != nil {
+					errorChan <- FileError{
+						FileName:    fileName,
+						Description: fmt.Sprintf("File not found: %v", statErr),
+						LineNumber:  line,
+						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
+					}
+					resultChan <- false
+					return
+				}
+
 				// Try to open the file
 				fileContent, err := os.ReadFile(fileName)
 				if err != nil {
@@ -98,7 +110,7 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 
 				// Create SQL content with header and print statement
 				header := createHeader(fileName)
-				printStatement := createPrintStatement(fileName)
+				printStatement := createPrintStatement(fileName) // Note: Using createPrintStatement for updates
 
 				// Lock for synchronized writing to output buffer
 				mu.Lock()
@@ -111,13 +123,13 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 				sqlOutputBuffer.WriteString(printStatement)
 				sqlOutputBuffer.WriteString("\n\n")
 
-				// Write file content to buffer
-				sqlOutputBuffer.Write(fileContent)
-
-				if err != nil {
+				// Write the file content
+				_, writeErr := sqlOutputBuffer.WriteString(string(fileContent))
+				if writeErr != nil {
 					errorChan <- FileError{
 						FileName:    fileName,
-						Description: err.Error(),
+						Description: writeErr.Error(),
+						LineNumber:  line,
 						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
 						Content:     string(fileContent),
 					}
@@ -128,7 +140,6 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 				// Mark file as processed
 				delete(allFiles, fileName)
 				resultChan <- true
-
 			}(spFile, spFileLine)
 		}
 	}
@@ -383,10 +394,11 @@ func processBuildOrderFile(
 				// Try to open the file
 				fileContent, err := os.ReadFile(fileName)
 				if err != nil {
+					// Handle file not found or other read errors gracefully
 					errorChan <- FileError{
 						FileName:    fileName,
 						Description: err.Error(),
-						LineNumber:  line, // Using line number here
+						LineNumber:  line,
 						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
 					}
 					resultChan <- false
@@ -413,12 +425,12 @@ func processBuildOrderFile(
 					appendMiscSettings(sqlOutputBuffer, databaseScriptsPath)
 				}
 
-				_, err = sqlOutputBuffer.Write(fileContent)
-
-				if err != nil {
+				_, writeErr := sqlOutputBuffer.Write(fileContent)
+				if writeErr != nil {
 					errorChan <- FileError{
 						FileName:    fileName,
-						Description: err.Error(),
+						Description: writeErr.Error(),
+						LineNumber:  line,
 						TimeStamp:   time.Now().Format("2006-01-02 15:04:05"),
 						Content:     string(fileContent),
 					}
@@ -430,7 +442,7 @@ func processBuildOrderFile(
 				delete(allFiles, fileName)
 				resultChan <- true
 
-			}(spFile, lineNumber, includeServerSettings) // Passing lineNumber instead of spFileLine
+			}(spFile, lineNumber, includeServerSettings)
 		}
 	}
 
