@@ -245,6 +245,7 @@ func BuildSqlProcs(sourcePath string) string {
 		wg                       sync.WaitGroup
 		mu                       sync.Mutex
 		sqlOutputBuffer          strings.Builder // Buffer to store SQL content instead of file
+		fileErrors               []FileError     // Collect errors for later processing
 	)
 
 	// Create log file
@@ -258,8 +259,8 @@ func BuildSqlProcs(sourcePath string) string {
 	// Load all file paths into a map
 	loadFileList(databaseScriptsPath, allFiles)
 
-	// Process main build order file
-	processedCount1, hasErrors1 := processBuildOrderFile(
+	// Process both build order files
+	processBuildOrderFile(
 		spBuildOrderFilePath,
 		&sqlOutputBuffer, // Use string builder instead of file
 		logFile,
@@ -272,8 +273,7 @@ func BuildSqlProcs(sourcePath string) string {
 		true, // Include server settings for SPs
 	)
 
-	// Process update order file
-	processedCount2, hasErrors2 := processBuildOrderFile(
+	processBuildOrderFile(
 		buildUpdateOrderFilePath,
 		&sqlOutputBuffer, // Use string builder instead of file
 		logFile,
@@ -286,25 +286,47 @@ func BuildSqlProcs(sourcePath string) string {
 		false, // Don't include server settings for updates
 	)
 
-	// Wait for all goroutines to complete and close channels
+	// Create a channel to signal when all goroutines are done
+	done := make(chan struct{})
+
+	// Start a collector goroutine to gather results and errors
 	go func() {
+		// First wait for all worker goroutines to finish
 		wg.Wait()
-		close(errorChan)
-		close(resultChan)
+
+		// Now collect results until channels are empty
+		remaining := 0
+		for {
+			select {
+			case result, ok := <-resultChan:
+				if !ok {
+					// Channel closed
+					break
+				}
+				if result {
+					successCount++
+				} else {
+					errorFlag = true
+				}
+				remaining++
+			case fileErr, ok := <-errorChan:
+				if !ok {
+					// Channel closed
+					break
+				}
+				fileErrors = append(fileErrors, fileErr)
+			default:
+				// No more items in channels
+				close(resultChan)
+				close(errorChan)
+				done <- struct{}{}
+				return
+			}
+		}
 	}()
 
-	// Count successful operations
-	for result := range resultChan {
-		if result {
-			successCount++
-		} else {
-			errorFlag = true
-		}
-	}
-
-	// Combine results from both file processing operations
-	successCount += processedCount1 + processedCount2
-	errorFlag = errorFlag || hasErrors1 || hasErrors2
+	// Wait for collector to finish
+	<-done
 
 	// Write final message to output buffer
 	sqlOutputBuffer.WriteString("\n")
@@ -312,7 +334,7 @@ func BuildSqlProcs(sourcePath string) string {
 
 	// Write errors to log file
 	logWriter := bufio.NewWriter(logFile)
-	for err := range errorChan {
+	for _, err := range fileErrors {
 		logWriter.WriteString(fmt.Sprintf("File Name: %s\n", err.FileName))
 		logWriter.WriteString(fmt.Sprintf("Err Message: %s\n", err.Description))
 		if err.LineNumber > 0 {
