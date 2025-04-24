@@ -15,7 +15,6 @@ const (
 	SP_BUILD_ORDER_FILE     = "SpBuildOrder.txt"
 	BUILD_UPDATE_ORDER_FILE = "BuildUpdateOrder.txt"
 	SP_LOG_FILE             = "SpBuildLog.txt"
-	DATABASE_SCRIPTS_PATH   = ""
 	BUILD_ORDER_FILE        = "BuildUpdateOrder.txt"
 	LOG_FILE                = "BuildUpdateLog.txt"
 )
@@ -37,15 +36,12 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 
 	// Initialize variables
 	var (
-		databaseScriptsPath = filepath.Join(sourcePath, DATABASE_SCRIPTS_PATH)
+		databaseScriptsPath = filepath.Join(sourcePath, "")
 		buildOrderFilePath  = filepath.Join(databaseScriptsPath, BUILD_ORDER_FILE)
 		logFilePath         = filepath.Join(databaseScriptsPath, LOG_FILE)
 		errorFlag           = false
 		successCount        = 0
-		spFileLine          = 0
 		allFiles            = make(map[string]bool)
-		wg                  sync.WaitGroup
-		mu                  sync.Mutex
 		sqlOutputBuffer     strings.Builder
 	)
 
@@ -68,68 +64,61 @@ func BuildSqlUpdates(sourcePath string) (string, error) {
 	// Load all file paths into a map
 	loadFileList(databaseScriptsPath, allFiles)
 
-	// Process build order file
+	// Process build order file sequentially
 	scanner := bufio.NewScanner(buildOrderFile)
+	spFileLine := 0
 	for scanner.Scan() {
 		spFile := strings.TrimSpace(scanner.Text())
 		spFileLine++
 
 		if len(spFile) > 0 && !strings.HasPrefix(spFile, "'") {
-			wg.Add(1)
-			go func(fileName string, line int) {
-				defer wg.Done()
+			// Process each file sequentially
+			fileName := spFile
+			line := spFileLine
 
-				// Check if file exists
-				_, statErr := os.Stat(fileName)
-				if statErr != nil {
-					fmt.Printf("Error: File not found: %s (line %d): %v\n",
-						fileName, line, statErr)
-					errorFlag = true
-					return
-				}
+			// Check if file exists
+			_, statErr := os.Stat(fileName)
+			if statErr != nil {
+				fmt.Printf("Error: File not found: %s (line %d): %v\n",
+					fileName, line, statErr)
+				errorFlag = true
+				continue
+			}
 
-				// Try to open the file
-				fileContent, err := os.ReadFile(fileName)
-				if err != nil {
-					fmt.Printf("Error reading file: %s (line %d): %v\n",
-						fileName, line, err)
-					errorFlag = true
-					return
-				}
+			// Try to open the file
+			fileContent, err := os.ReadFile(fileName)
+			if err != nil {
+				fmt.Printf("Error reading file: %s (line %d): %v\n",
+					fileName, line, err)
+				errorFlag = true
+				continue
+			}
 
-				// Create SQL content with header and print statement
-				header := createHeader(fileName)
-				printStatement := createPrintStatement(fileName)
+			// Create SQL content with header and print statement
+			header := createHeader(fileName)
+			printStatement := createPrintStatement(fileName)
 
-				// Lock for synchronized writing to output buffer
-				mu.Lock()
-				defer mu.Unlock()
+			// Write to output buffer with proper spacing
+			sqlOutputBuffer.WriteString("\n")
+			sqlOutputBuffer.WriteString(header)
+			sqlOutputBuffer.WriteString("\n\n")
+			sqlOutputBuffer.WriteString(printStatement)
+			sqlOutputBuffer.WriteString("\n\n")
 
-				// Write to output buffer with proper spacing
-				sqlOutputBuffer.WriteString("\n")
-				sqlOutputBuffer.WriteString(header)
-				sqlOutputBuffer.WriteString("\n\n")
-				sqlOutputBuffer.WriteString(printStatement)
-				sqlOutputBuffer.WriteString("\n\n")
+			// Write the file content
+			_, writeErr := sqlOutputBuffer.WriteString(string(fileContent))
+			if writeErr != nil {
+				fmt.Printf("Error writing content to buffer: %s (line %d): %v\n",
+					fileName, line, writeErr)
+				errorFlag = true
+				continue
+			}
 
-				// Write the file content
-				_, writeErr := sqlOutputBuffer.WriteString(string(fileContent))
-				if writeErr != nil {
-					fmt.Printf("Error writing content to buffer: %s (line %d): %v\n",
-						fileName, line, writeErr)
-					errorFlag = true
-					return
-				}
-
-				// Mark file as processed
-				delete(allFiles, fileName)
-				successCount++
-			}(spFile, spFileLine)
+			// Mark file as processed
+			delete(allFiles, fileName)
+			successCount++
 		}
 	}
-
-	// Wait for all goroutines to complete
-	wg.Wait()
 
 	// Write final message to output buffer
 	sqlOutputBuffer.WriteString("\n")
@@ -180,8 +169,6 @@ func BuildSqlProcs(sourcePath string) string {
 		errorFlag                = false
 		successCount             = 0
 		allFiles                 = make(map[string]bool)
-		wg                       sync.WaitGroup
-		mu                       sync.Mutex
 		sqlOutputBuffer          strings.Builder
 	)
 
@@ -196,14 +183,14 @@ func BuildSqlProcs(sourcePath string) string {
 	// Load all file paths into a map
 	loadFileList(databaseScriptsPath, allFiles)
 
-	// Process both build order files
+	// Process both build order files sequentially
 	processBuildOrderFile(
 		spBuildOrderFilePath,
 		&sqlOutputBuffer,
 		logFile,
 		allFiles,
-		&wg,
-		&mu,
+		nil, // No need for waitgroup
+		nil, // No need for mutex
 		databaseScriptsPath,
 		true, // Include server settings for SPs
 	)
@@ -213,14 +200,11 @@ func BuildSqlProcs(sourcePath string) string {
 		&sqlOutputBuffer,
 		logFile,
 		allFiles,
-		&wg,
-		&mu,
+		nil, // No need for waitgroup
+		nil, // No need for mutex
 		databaseScriptsPath,
 		false, // Don't include server settings for updates
 	)
-
-	// Wait for all goroutines to complete
-	wg.Wait()
 
 	// Write final message to output buffer
 	sqlOutputBuffer.WriteString("\n")
@@ -274,9 +258,7 @@ func processBuildOrderFile(
 
 	// Write server settings if required
 	if includeServerSettings {
-		mu.Lock()
 		appendMiscSettings(sqlOutputBuffer, databaseScriptsPath)
-		mu.Unlock()
 	}
 
 	// Process build order file
@@ -294,65 +276,50 @@ func processBuildOrderFile(
 				spFile = filepath.Join(databaseScriptsPath, spFile)
 			}
 
-			// Increment the wait group
-			wg.Add(1)
+			// Check if file exists
+			_, statErr := os.Stat(spFile)
+			if statErr != nil {
+				// Just log the error to console
+				fmt.Printf("Error: File not found: %s (line %d): %v\n",
+					spFile, spFileLine, statErr)
+				continue
+			}
 
-			// Line number for error reporting
-			currentLine := spFileLine
-			currentFile := spFile
+			// Read the file content
+			fileContent, err := os.ReadFile(spFile)
+			if err != nil {
+				fmt.Printf("Error reading file: %s (line %d): %v\n",
+					spFile, spFileLine, err)
+				continue
+			}
 
-			go func() {
-				defer wg.Done()
+			// Create header and print statement
+			var header, printStatement string
 
-				// Check if file exists
-				_, statErr := os.Stat(currentFile)
-				if statErr != nil {
-					// Just log the error to console
-					fmt.Printf("Error: File not found: %s (line %d): %v\n",
-						currentFile, currentLine, statErr)
-					return
-				}
+			if includeServerSettings {
+				header = createHeader(spFile)
+				printStatement = createStoredProcPrint(spFile)
+			} else {
+				header = createHeader(spFile)
+				printStatement = createPrintStatement(spFile)
+			}
 
-				// Read the file content
-				fileContent, err := os.ReadFile(currentFile)
-				if err != nil {
-					fmt.Printf("Error reading file: %s (line %d): %v\n",
-						currentFile, currentLine, err)
-					return
-				}
+			// Write to output buffer with proper spacing
+			sqlOutputBuffer.WriteString("\n")
+			sqlOutputBuffer.WriteString(header)
+			sqlOutputBuffer.WriteString("\n\n")
+			sqlOutputBuffer.WriteString(printStatement)
+			sqlOutputBuffer.WriteString("\n\n")
 
-				// Create header and print statement
-				var header, printStatement string
+			// Write content
+			if _, err := sqlOutputBuffer.WriteString(string(fileContent)); err != nil {
+				fmt.Printf("Error writing content to buffer: %s (line %d): %v\n",
+					spFile, spFileLine, err)
+				continue
+			}
 
-				if includeServerSettings {
-					header = createHeader(currentFile)
-					printStatement = createStoredProcPrint(currentFile)
-				} else {
-					header = createHeader(currentFile)
-					printStatement = createPrintStatement(currentFile)
-				}
-
-				// Lock for synchronized writing to buffer
-				mu.Lock()
-				defer mu.Unlock()
-
-				// Write to output buffer with proper spacing
-				sqlOutputBuffer.WriteString("\n")
-				sqlOutputBuffer.WriteString(header)
-				sqlOutputBuffer.WriteString("\n\n")
-				sqlOutputBuffer.WriteString(printStatement)
-				sqlOutputBuffer.WriteString("\n\n")
-
-				// Write content
-				if _, err := sqlOutputBuffer.WriteString(string(fileContent)); err != nil {
-					fmt.Printf("Error writing content to buffer: %s (line %d): %v\n",
-						currentFile, currentLine, err)
-					return
-				}
-
-				// Mark file as processed
-				delete(allFiles, currentFile)
-			}()
+			// Mark file as processed
+			delete(allFiles, spFile)
 		}
 	}
 }
